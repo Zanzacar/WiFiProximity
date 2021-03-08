@@ -1,87 +1,186 @@
-#include <WiFi.h>
-
 #include "esp_wifi.h"
 
 String maclist[64][3]; 
 int listcount = 0;
 
-String KnownMac[10][2] = {  // Put devices you want to be reconized
-  {"Will-Phone","EC1F7ffffffD"},
-  {"Will-PC","E894Fffffff3"},
-  {"NAME","MACADDRESS"},
-  {"NAME","MACADDRESS"},
-  {"NAME","MACADDRESS"},
-  {"NAME","MACADDRESS"},
-  {"NAME","MACADDRESS"},
-  {"NAME","MACADDRESS"},
-  {"NAME","MACADDRESS"}
-};
+typedef struct
+{
+  unsigned interval:16;
+  unsigned capability:16;
+  unsigned tag_number:8;
+  unsigned tag_length:8;
+  char ssid[0];
+  uint8_t rates[1];
+} wifi_mgmt_beacon_t;
+
+typedef enum
+{
+    ASSOCIATION_REQ,
+    ASSOCIATION_RES,
+    REASSOCIATION_REQ,
+    REASSOCIATION_RES,
+    PROBE_REQ,
+    PROBE_RES,
+    NU1,  /* ......................*/
+    NU2,  /* 0110, 0111 not used */
+    BEACON,
+    ATIM,
+    DISASSOCIATION,
+    AUTHENTICATION,
+    DEAUTHENTICATION,
+    ACTION,
+    ACTION_NACK,
+} wifi_mgmt_subtypes_t;
+
+//Parses 802.11 packet type-subtype pair into a human-readable string
+const char* wifi_pkt_type2str(wifi_promiscuous_pkt_type_t type, wifi_mgmt_subtypes_t subtype)
+{
+    switch(type)
+    {
+        case WIFI_PKT_MGMT:
+            switch(subtype)
+            {
+                case ASSOCIATION_REQ:
+                    return "Mgmt: Association request";
+                case ASSOCIATION_RES:
+                    return "Mgmt: Association response";
+                case REASSOCIATION_REQ:
+                    return "Mgmt: Reassociation request";
+                case REASSOCIATION_RES:
+                    return "Mgmt: Reassociation response";
+                case PROBE_REQ:
+                    return "Mgmt: Probe request";
+                case PROBE_RES:
+                    return "Mgmt: Probe response";
+                case BEACON:
+                    return "Mgmt: Beacon frame";
+                case ATIM:
+                    return "Mgmt: ATIM";
+                case DISASSOCIATION:
+                    return "Mgmt: Dissasociation";
+                case AUTHENTICATION:
+                    return "Mgmt: Authentication";
+                case DEAUTHENTICATION:
+                    return "Mgmt: Deauthentication";
+                case ACTION:
+                    return "Mgmt: Action";
+                case ACTION_NACK:
+                    return "Mgmt: Action no ack";
+                default:
+                    return "Mgmt: Unsupported/error";
+            }
+
+        case WIFI_PKT_CTRL:
+            return "Control";
+
+        case WIFI_PKT_DATA:
+            return "Data";
+
+        default:
+            return "Unsupported/error";
+    }
+}
+
+
+typedef struct
+{
+    unsigned protocol:2;
+    unsigned type:2;
+    unsigned subtype:4;
+    unsigned to_ds:1;
+    unsigned from_ds:1;
+    unsigned more_frag:1;
+    unsigned retry:1;
+    unsigned pwr_mgmt:1;
+    unsigned more_data:1;
+    unsigned wep:1;
+    unsigned strict:1;
+} wifi_header_frame_control_t;
+
+typedef struct
+{
+    wifi_header_frame_control_t frame_ctrl;
+    uint8_t addr1[6]; /* receiver address */
+    uint8_t addr2[6]; /* sender address */
+    uint8_t addr3[6]; /* filtering address */
+    unsigned sequence_ctrl:16;
+    uint8_t addr4[6]; /* optional */
+} wifi_ieee80211_mac_hdr_t;
+
+typedef struct
+{
+    wifi_ieee80211_mac_hdr_t hdr;
+    uint8_t payload[2]; /* network data ended with 4 bytes csum (CRC32) */
+} wifi_ieee80211_packet_t;
 
 String defaultTTL = "60"; // Maximum time (Apx seconds) elapsed before device is consirded offline
 
 const wifi_promiscuous_filter_t filt={ //Idk what this does
-    .filter_mask=WIFI_PROMIS_FILTER_MASK_MGMT|WIFI_PROMIS_FILTER_MASK_DATA
+    //.filter_mask=WIFI_PROMIS_FILTER_MASK_MGMT|WIFI_PROMIS_FILTER_MASK_DATA
+    .filter_mask=WIFI_PROMIS_FILTER_MASK_CTRL|WIFI_PROMIS_FILTER_MASK_DATA
 };
 
-typedef struct { // or this
-  uint8_t mac[6];
-} __attribute__((packed)) MacAddr;
+void mac2str(const uint8_t* ptr, char* string)
+{
+  sprintf(string, "%02x:%02x:%02x:%02x:%02x:%02x", ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5]);
+  return;
+}
 
-typedef struct { 
-  int16_t fctl;
-  int16_t duration;
-  MacAddr da;
-  MacAddr sa;
-  MacAddr bssid;
-  int16_t seqctl;
-  unsigned char payload[];
-} __attribute__((packed)) WifiMgmtHdr;
-  
 #define maxCh 11 //max Channel -> US = 11, EU = 13, Japan = 14
 
 int curChannel = 1;
 
-void sniffer(void* buf, wifi_promiscuous_pkt_type_t type) { //This is where packets end up after they get sniffed
-  wifi_promiscuous_pkt_t *p = (wifi_promiscuous_pkt_t*)buf; // Dont know what these 3 lines do
-  int len = p->rx_ctrl.sig_len;
-  WifiMgmtHdr *wh = (WifiMgmtHdr*)p->payload;
-  len -= sizeof(WifiMgmtHdr);
-  if (len < 0){
-    Serial.println("Received 0");
-    return;
-  }
-  String packet;
-  String mac;
-  int fctl = ntohs(wh->fctl);
-  for(int i=8;i<=8+6+1;i++){ // This reads the first couple of bytes of the packet. This is where you can read the whole packet replaceing the "8+6+1" with "p->rx_ctrl.sig_len"
-     packet += String(p->payload[i],HEX);
-  }
-  for(int i=4;i<=15;i++){ // This removes the 'nibble' bits from the stat and end of the data we want. So we only get the mac address.
-    mac += packet[i];
-  }
-  mac.toUpperCase();
+void sniffer(void* buff, wifi_promiscuous_pkt_type_t type) {
+  const wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buff;
+  const wifi_ieee80211_packet_t *ipkt = (wifi_ieee80211_packet_t *)ppkt->payload;
+  const wifi_ieee80211_mac_hdr_t *hdr = &ipkt->hdr;
+  const uint8_t *data = ipkt->payload;
+  const wifi_header_frame_control_t *frame_ctrl = (wifi_header_frame_control_t *)&hdr->frame_ctrl;
+  
+  char addr1[] = "00:00:00:00:00:00\0";
+  char addr2[] = "00:00:00:00:00:00\0";
+  char addr3[] = "00:00:00:00:00:00\0";
 
-  
-  int added = 0;
-  for(int i=0;i<=63;i++){ // checks if the MAC address has been added before
-    if(mac == maclist[i][0]){
-      maclist[i][1] = defaultTTL;
-      if(maclist[i][2] == "OFFLINE"){
-        maclist[i][2] = "0";
-      }
-      added = 1;
+  mac2str(hdr->addr1, addr1);
+  mac2str(hdr->addr2, addr2);
+  mac2str(hdr->addr3, addr3);
+
+  // Output info to serial
+  Serial.printf("\n%s | %s | %s | %2u | %02d | %u | %u(%-2u) | %-28s | %u | %u | %u | %u | %u | %u | %u | %u | ",
+    addr1,
+    addr2,
+    addr3,
+    curChannel,
+    ppkt->rx_ctrl.rssi,
+    frame_ctrl->protocol,
+    frame_ctrl->type,
+    frame_ctrl->subtype,
+    wifi_pkt_type2str((wifi_promiscuous_pkt_type_t)frame_ctrl->type, (wifi_mgmt_subtypes_t)frame_ctrl->subtype),
+    frame_ctrl->to_ds,
+    frame_ctrl->from_ds,
+    frame_ctrl->more_frag,
+    frame_ctrl->retry,
+    frame_ctrl->pwr_mgmt,
+    frame_ctrl->more_data,
+    frame_ctrl->wep,
+    frame_ctrl->strict);
+
+  // Print ESSID if beacon
+  if (frame_ctrl->type == WIFI_PKT_MGMT && frame_ctrl->subtype == BEACON)
+  {
+    const wifi_mgmt_beacon_t *beacon_frame = (wifi_mgmt_beacon_t*) ipkt->payload;
+    char ssid[32] = {0};
+
+    if (beacon_frame->tag_length >= 32)
+    {
+      strncpy(ssid, beacon_frame->ssid, 31);
     }
-  }
-  
-  if(added == 0){ // If its new. add it to the array.
-    maclist[listcount][0] = mac;
-    maclist[listcount][1] = defaultTTL;
-    Serial.println(mac);
-    listcount ++;
-    if(listcount >= 64){
-      Serial.println("Too many addresses");
-      listcount = 0;
+    else
+    {
+      strncpy(ssid, beacon_frame->ssid, beacon_frame->tag_length);
     }
+
+    Serial.printf("%s", ssid);
   }
 }
 
@@ -103,64 +202,18 @@ void setup() {
   esp_wifi_set_promiscuous_filter(&filt);
   esp_wifi_set_promiscuous_rx_cb(&sniffer);
   esp_wifi_set_channel(curChannel, WIFI_SECOND_CHAN_NONE);
-  
-  Serial.println("starting!");
+
+  delay(5000);
+  Serial.printf("\n\n     MAC Address 1|      MAC Address 2|      MAC Address 3|  Ch| RSSI| Pr| T(S)  |           Frame type         |TDS|FDS| MF|RTR|PWR| MD|ENC|STR|   SSID");
 }
 
-void purge(){ // This maanges the TTL
-  for(int i=0;i<=63;i++){
-    if(!(maclist[i][0] == "")){
-      int ttl = (maclist[i][1].toInt());
-      ttl --;
-      if(ttl <= 0){
-        Serial.println("OFFLINE: " + maclist[i][0]);
-        maclist[i][2] = "OFFLINE";
-        maclist[i][1] = defaultTTL;
-      }else{
-        maclist[i][1] = String(ttl);
-      }
-    }
-  }
-}
-
-void updatetime(){ // This updates the time the device has been online for
-  for(int i=0;i<=63;i++){
-    if(!(maclist[i][0] == "")){
-      if(maclist[i][2] == "")maclist[i][2] = "0";
-      if(!(maclist[i][2] == "OFFLINE")){
-          int timehere = (maclist[i][2].toInt());
-          timehere ++;
-          maclist[i][2] = String(timehere);
-      }
-      Serial.println(maclist[i][0] + " : " + maclist[i][2]);
-    }
-  }
-}
-
-void showpeople(){ // This checks if the MAC is in the reckonized list and then displays it on the OLED and/or prints it to serial.
-  for(int i=0;i<=63;i++){
-    String tmp1 = maclist[i][0];
-    if(!(tmp1 == "")){
-      for(int j=0;j<=9;j++){
-        String tmp2 = KnownMac[j][1];
-        if(tmp1 == tmp2){
-          Serial.println(KnownMac[j][0] + " : " + tmp1 + " : " + maclist[i][2] + "\n -- \n");
-        }
-      }
-    }
-  }
-}
 
 //===== LOOP =====//
 void loop() {
-    Serial.println("Changed channel:" + String(curChannel));
     if(curChannel > maxCh){ 
       curChannel = 1;
     }
     esp_wifi_set_channel(curChannel, WIFI_SECOND_CHAN_NONE);
-    delay(5000);
-    updatetime();
-    purge();
-    showpeople();
+    delay(100);
     curChannel++;
 }
